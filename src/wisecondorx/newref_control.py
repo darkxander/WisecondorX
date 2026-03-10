@@ -1,27 +1,28 @@
 # WisecondorX
 
-import copy
 import logging
 import os
-import sys
-import time
 
 import numpy as np
-from concurrent import futures
 
-from wisecondorx.newref_tools import normalize_and_mask, train_pca, get_reference
-
-"""
-Outputs preparation files of read depth normalized
-data and contains PCA information to execute between-
-sample normalization during testing. Function is
-executed three times. Once for autosomes, once for XX
-gonosomes (if enough females are included) and once
-for XY gonosomes (if enough males are included).
-"""
+from wisecondorx.newref_tools import (
+    apply_early_masking,
+    compute_null_ratios_parallel,
+    knn_search_all_chromosomes,
+    normalize_and_mask,
+    reduce_dimensions,
+    train_pca,
+)
 
 
 def tool_newref_prep(args, samples, gender, mask, bins_per_chr):
+    """Prepare reference data: normalize, mask, PCA, dim reduction.
+
+    Creates:
+      - prepfile: metadata .npz
+      - prepdatafile: full PCA-corrected data .npy (for null ratios)
+      - prepreducedfile: reduced data .npy (for KNN distances)
+    """
     if gender == "A":
         last_chr = 22
     elif gender == "F":
@@ -31,41 +32,65 @@ def tool_newref_prep(args, samples, gender, mask, bins_per_chr):
 
     bins_per_chr = bins_per_chr[:last_chr]
     mask = mask[: np.sum(bins_per_chr)]
+    chrs = range(1, last_chr + 1)
 
-    masked_data = normalize_and_mask(samples, range(1, last_chr + 1), mask)
-    pca_corrected_data, pca = train_pca(masked_data)
+    masked_data = normalize_and_mask(samples, chrs, mask)
 
-    # PCA Distance filtering: remove bins that sit far from the median profile (unmatchable)
-    # This reduces noise on autosomes and handles extreme chrY outliers
+    # Early bin masking: remove low-mean and high-CV bins
+    masked_data = apply_early_masking(
+        masked_data, mask, samples, chrs
+    )
+
+    pca_corrected_data, pca = train_pca(
+        masked_data, pcacomp=args.pcacomp
+    )
+
+    # PCA Distance filtering: remove bins far from median profile
     med_prof = np.median(pca_corrected_data, axis=0)
-    dist_to_med = np.sum((pca_corrected_data - med_prof)**2, axis=1)
-    mad = np.median(np.abs(dist_to_med - np.median(dist_to_med)))
-    # 10*MAD is a conservative but robust cutoff for heavy tails
-    # We also enforce a floor of 5.0 to avoid over-trimming very clean data
+    dist_to_med = np.sum(
+        (pca_corrected_data - med_prof) ** 2, axis=1
+    )
+    mad = np.median(
+        np.abs(dist_to_med - np.median(dist_to_med))
+    )
     cutoff = max(np.median(dist_to_med) + 10 * mad, 5.0)
     bad_bins_mask = dist_to_med > cutoff
 
     if np.any(bad_bins_mask):
         n_removed = np.sum(bad_bins_mask)
-        logging.info(f"Removing {n_removed} anomalous bins based on PCA distance (cutoff={cutoff:.4f})")
-        # Update the global mask (mask is a view into total_mask passed from main.py)
+        logging.info(
+            "Removing {} anomalous bins based on PCA distance "
+            "(cutoff={:.4f})".format(n_removed, cutoff)
+        )
         masked_indices = np.where(mask)[0]
         global_bad_indices = masked_indices[bad_bins_mask]
         mask[global_bad_indices] = False
 
-        # Re-train PCA on the cleaned set of bins
-        masked_data = normalize_and_mask(samples, range(1, last_chr + 1), mask)
-        pca_corrected_data, pca = train_pca(masked_data)
+        masked_data = normalize_and_mask(samples, chrs, mask)
+        pca_corrected_data, pca = train_pca(
+            masked_data, pcacomp=args.pcacomp
+        )
+
+    # Dimensionality reduction for KNN
+    pca_reduced_data = reduce_dimensions(
+        pca_corrected_data, n_components=args.n_components
+    )
 
     masked_bins_per_chr = [
-        sum(mask[sum(bins_per_chr[:i]) : sum(bins_per_chr[:i]) + x])
+        sum(
+            mask[
+                sum(bins_per_chr[:i]) : sum(bins_per_chr[:i]) + x
+            ]
+        )
         for i, x in enumerate(bins_per_chr)
     ]
     masked_bins_per_chr_cum = [
-        sum(masked_bins_per_chr[: x + 1]) for x in range(len(masked_bins_per_chr))
+        sum(masked_bins_per_chr[: x + 1])
+        for x in range(len(masked_bins_per_chr))
     ]
 
     np.save(args.prepdatafile, pca_corrected_data)
+    np.save(args.prepreducedfile, pca_reduced_data)
 
     np.savez_compressed(
         args.prepfile,
@@ -80,158 +105,83 @@ def tool_newref_prep(args, samples, gender, mask, bins_per_chr):
     )
 
 
-"""
-Prepares subfiles if multi-threading is requested.
-Main file is split in 'cpus' subfiles, each subfile
-is processed by a separate thread.
-"""
-
-
 def tool_newref_main(args, cpus):
-    pca_corrected_data = np.load(args.prepdatafile, mmap_mode="r")
-    if cpus != 1:
-        with futures.ThreadPoolExecutor(max_workers=args.cpus) as executor:
-            for part in range(1, cpus + 1):
-                this_args = copy.copy(args)
-                this_args.part = [part, cpus]
-                executor.submit(_tool_newref_part, this_args, pca_corrected_data)
-            executor.shutdown(wait=True)
-    else:
-        for part in range(1, cpus + 1):
-            args.part = [part, cpus]
-            _tool_newref_part(args, pca_corrected_data)
-
-    tool_newref_post(args, cpus)
-
-    os.remove(args.prepfile)
-    os.remove(args.prepdatafile)
-    for part in range(1, cpus + 1):
-        os.remove("{}_{}.npz".format(args.partfile, str(part)))
-
-
-"""
-Function executed once for each thread. Controls
-within-sample reference creation.
-"""
-
-
-def _tool_newref_part(args, pca_corrected_data):
-    if args.part[0] > args.part[1]:
-        logging.critical(
-            "Part should be smaller or equal to total parts:{} > {} is wrong".format(
-                args.part[0], args.part[1]
-            )
-        )
-        sys.exit()
-    if args.part[0] < 0:
-        logging.critical(
-            "Part should be at least zero: {} < 0 is wrong".format(args.part[0])
-        )
-        sys.exit()
-
-    npzdata = np.load(args.prepfile, encoding="latin1", allow_pickle=True)
+    """Run KNN search and null ratio computation."""
+    pca_corrected_data = np.load(
+        args.prepdatafile, mmap_mode="r"
+    )
+    pca_reduced_data = np.load(
+        args.prepreducedfile, mmap_mode="r"
+    )
+    npzdata = np.load(
+        args.prepfile, encoding="latin1", allow_pickle=True
+    )
     masked_bins_per_chr = npzdata["masked_bins_per_chr"]
     masked_bins_per_chr_cum = npzdata["masked_bins_per_chr_cum"]
 
-    indexes, distances, null_ratios = get_reference(
-        pca_corrected_data,
+    # KNN search using ANN backend
+    indexes, distances = knn_search_all_chromosomes(
+        pca_reduced_data,
         masked_bins_per_chr,
         masked_bins_per_chr_cum,
         ref_size=args.refsize,
-        part=args.part[0],
-        split_parts=args.part[1],
+        chunk_size=args.chunk_size,
     )
 
-    np.savez_compressed(
-        "{}_{}.npz".format(args.partfile, str(args.part[0])),
-        indexes=indexes,
-        distances=distances,
-        null_ratios=null_ratios,
+    # Null ratios — vectorized, parallelized over chunks
+    null_ratios = compute_null_ratios_parallel(
+        pca_corrected_data,
+        indexes,
+        cpus=cpus,
+        chunk_size=args.chunk_size,
     )
 
-
-"""
-Merges separate subfiles (one for each thread) to a
-new temporary output file.
-"""
-
-
-def tool_newref_post(args, cpus):
-    npzdata_prep = np.load(args.prepfile, encoding="latin1", allow_pickle=True)
-
-    big_indexes = []
-    big_distances = []
-    big_null_ratios = []
-    for part in range(1, cpus + 1):
-        infile = "{}_{}.npz".format(args.partfile, str(part))
-        npzdata_part = np.load(infile, encoding="latin1")
-        big_indexes.extend(npzdata_part["indexes"])
-        big_distances.extend(npzdata_part["distances"])
-        big_null_ratios.extend(npzdata_part["null_ratios"])
-
-    indexes = np.array(big_indexes)
-    distances = np.array(big_distances)
-    null_ratios = np.array(big_null_ratios)
-
+    # Save results directly (no intermediate part files)
     np.savez_compressed(
         args.tmpoutfile,
-        binsize=npzdata_prep["binsize"].item(),
-        gender=npzdata_prep["gender"].item(),
-        mask=npzdata_prep["mask"],
-        bins_per_chr=npzdata_prep["bins_per_chr"],
-        masked_bins_per_chr=npzdata_prep["masked_bins_per_chr"],
-        masked_bins_per_chr_cum=npzdata_prep["masked_bins_per_chr_cum"],
-        pca_components=npzdata_prep["pca_components"],
-        pca_mean=npzdata_prep["pca_mean"],
+        binsize=npzdata["binsize"].item(),
+        gender=npzdata["gender"].item(),
+        mask=npzdata["mask"],
+        bins_per_chr=npzdata["bins_per_chr"],
+        masked_bins_per_chr=npzdata["masked_bins_per_chr"],
+        masked_bins_per_chr_cum=npzdata["masked_bins_per_chr_cum"],
+        pca_components=npzdata["pca_components"],
+        pca_mean=npzdata["pca_mean"],
         indexes=indexes,
         distances=distances,
         null_ratios=null_ratios,
     )
 
-
-"""
-Tries to remove text file, when it is busy, until becomes successful.
-This function, prevents OSError: [Errno 26] Text file busy...
-"""
-
-
-def force_remove(file_id):
-    attemp = 1
-    while True:
-        try:
-            os.remove(file_id)
-            break
-        except:
-            print(
-                "Attemp #{}: Cannot remove {}, because it is busy, trying again...".format(
-                    attemp, file_id
-                )
-            )
-            attemp = attemp + 1
-            time.sleep(5)
-
-
-"""
-Merges separate subfiles (A, F, M) to one final
-reference file.
-"""
+    # Cleanup prep files
+    os.remove(args.prepfile)
+    os.remove(args.prepdatafile)
+    os.remove(args.prepreducedfile)
 
 
 def tool_newref_merge(args, outfiles, trained_cutoff):
+    """Merge gender-specific references into final output."""
     final_ref = {"has_female": False, "has_male": False}
     for file_id in outfiles:
-        npz_file = np.load(file_id, encoding="latin1", allow_pickle=True)
+        npz_file = np.load(
+            file_id, encoding="latin1", allow_pickle=True
+        )
         gender = str(npz_file["gender"])
-        for component in [x for x in npz_file.keys() if x != "gender"]:
+        for component in [
+            x for x in npz_file.keys() if x != "gender"
+        ]:
             if gender == "F":
                 final_ref["has_female"] = True
-                final_ref["{}.F".format(str(component))] = npz_file[component]
+                final_ref["{}.F".format(str(component))] = (
+                    npz_file[component]
+                )
             elif gender == "M":
                 final_ref["has_male"] = True
-                final_ref["{}.M".format(str(component))] = npz_file[component]
+                final_ref["{}.M".format(str(component))] = (
+                    npz_file[component]
+                )
             else:
                 final_ref[str(component)] = npz_file[component]
-        force_remove(file_id)
+        os.remove(file_id)
     final_ref["is_nipt"] = args.nipt
     final_ref["trained_cutoff"] = trained_cutoff
     np.savez_compressed(args.outfile, **final_ref)

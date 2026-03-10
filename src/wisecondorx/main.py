@@ -16,6 +16,7 @@ from wisecondorx.newref_control import (
 )
 from wisecondorx.newref_tools import train_gender_model, get_mask
 from wisecondorx.overall_tools import gender_correct, scale_sample
+from wisecondorx.ref_qc import qc_reference
 from wisecondorx.predict_control import normalize, get_post_processed_result
 from wisecondorx.predict_output import generate_output_tables, exec_write_plots
 from wisecondorx.predict_tools import (
@@ -55,7 +56,7 @@ def tool_newref(args):
     args.basepath = base_path
     args.prepfile = "{}_prep.npz".format(base_path)
     args.prepdatafile = "{}_prep_data.npy".format(base_path)
-    args.partfile = "{}_part".format(base_path)
+    args.prepreducedfile = "{}_prep_data_reduced.npy".format(base_path)
 
     samples = []
     logging.info("Importing data ...")
@@ -109,7 +110,7 @@ def tool_newref(args):
             args, samples[np.array(genders) == "F"], "F", total_mask, bins_per_chr
         )
         logging.info("This might take a while ...")
-        tool_newref_main(args, 1)
+        tool_newref_main(args, args.cpus)
     else:
         logging.warning(
             "Provide at least 5 female samples to enable normalization of female gonosomes."
@@ -123,7 +124,7 @@ def tool_newref(args):
             tool_newref_prep(
                 args, samples[np.array(genders) == "M"], "M", total_mask, bins_per_chr
             )
-            tool_newref_main(args, 1)
+            tool_newref_main(args, args.cpus)
         else:
             logging.warning(
                 "Provide at least 5 male samples to enable normalization of male gonosomes."
@@ -381,6 +382,26 @@ def main():
     )
     parser_newref.add_argument(
         "--cpus", type=int, default=1, help="Use multiple cores to find reference bins"
+    )
+    parser_newref.add_argument(
+        "--chunk-size",
+        type=int,
+        default=50000,
+        dest="chunk_size",
+        help="Number of bins per processing chunk (controls peak RAM)",
+    )
+    parser_newref.add_argument(
+        "--n-components",
+        type=int,
+        default=30,
+        dest="n_components",
+        help="PCA components for KNN dimensionality reduction",
+    )
+    parser_newref.add_argument(
+        "--pcacomp",
+        type=int,
+        default=5,
+        help="PCA components for between-sample normalization",
     )
     parser_newref.set_defaults(func=tool_newref)
 

@@ -1,6 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wisecondorx"
+version = "2.0.0"
+description = "WisecondorX -- an evolved WISECONDOR"
+readme = "README.md"
+license = "LicenseRef-by-nc-sa"
+license-files = ["LICENSE.md"]
+requires-python = ">=3.9,<3.14"
+authors = [
+    { name = "Matthias De Smet, Lennart Raman", email = "ict@cmgg.be" },
+]
+keywords = [
+    "bioinformatics",
+    "biology",
+    "sequencing",
+    "NGS",
+    "next generation sequencing",
+    "CNV",
+    "SWGS",
+    "Shallow Whole Genome Sequencing",
+]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "scipy",
+    "scikit-learn<=1.4.2",
+    "pysam",
+    "numpy",
+    "pandas",
+    "joblib",
+]
+
+[project.optional-dependencies]
+fast = ["faiss-cpu"]
+ann = ["hnswlib"]
+testing = ["flake8", "black", "pre-commit"]
+
+[project.scripts]
+wisecondorx = "wisecondorx.main:main"
+WisecondorX = "wisecondorx.main:main"
+wisecondorX = "wisecondorx.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wisecondorx"]
+
 [tool.black]
 line-length = 79
-target_version = ['py36','py37','py38','py39']
+target_version = ['py39', 'py310', 'py311', 'py312']
 include = '\.pyi?$'
 exclude = '''
 /(
@@ -15,3 +78,8 @@ exclude = '''
   | dist
 )/
 '''
+
+[tool.flake8]
+ignore = ["E266", "E203", "E501", "C901", "W503"]
+max-line-length = 79
+max-complexity = 18

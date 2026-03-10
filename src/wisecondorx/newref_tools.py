@@ -1,6 +1,5 @@
 # WisecondorX
 
-import bisect
 import logging
 import random
 
@@ -9,13 +8,41 @@ from scipy.signal import argrelextrema
 from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 
-"""
-A Gaussian mixture model is fitted against
-all one-dimensional reference y-fractions.
-Two components are expected: one for males,
-and one for females. The local minimum will
-serve as the cut-off point.
-"""
+# ---------------------------------------------------------------------------
+# KNN backend detection (faiss > hnswlib > sklearn)
+# ---------------------------------------------------------------------------
+_KNN_BACKEND = None
+
+try:
+    import faiss
+
+    _KNN_BACKEND = "faiss"
+except ImportError:
+    try:
+        import hnswlib
+
+        _KNN_BACKEND = "hnswlib"
+    except ImportError:
+        _KNN_BACKEND = "sklearn"
+
+
+def _log_knn_backend():
+    if _KNN_BACKEND == "faiss":
+        logging.info("KNN backend: faiss-cpu")
+    elif _KNN_BACKEND == "hnswlib":
+        logging.info(
+            "KNN backend: hnswlib (faiss-cpu not installed)"
+        )
+    else:
+        logging.warning(
+            "KNN backend: sklearn (slowest). "
+            "Install faiss-cpu or hnswlib for better performance."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gender model
+# ---------------------------------------------------------------------------
 
 
 def train_gender_model(args, samples):
@@ -24,7 +51,9 @@ def train_gender_model(args, samples):
     for sample in samples:
         y_fractions.append(
             float(np.sum(sample["24"]))
-            / float(np.sum([np.sum(sample[x]) for x in sample.keys()]))
+            / float(
+                np.sum([np.sum(sample[x]) for x in sample.keys()])
+            )
         )
     y_fractions = np.array(y_fractions)
 
@@ -48,7 +77,11 @@ def train_gender_model(args, samples):
         ax.set_xlim([0, 0.02])
         ax.legend(loc="best")
         plt.savefig(args.plotyfrac)
-        logging.info("Image written to {}, now quitting ...".format(args.plotyfrac))
+        logging.info(
+            "Image written to {}, now quitting ...".format(
+                args.plotyfrac
+            )
+        )
         exit()
 
     if args.yfrac is not None:
@@ -60,7 +93,11 @@ def train_gender_model(args, samples):
         local_min_i = argrelextrema(sorted_gmm_y, np.less)
 
         cut_off = gmm_x[local_min_i][0]
-        logging.info("Determined --yfrac cutoff: {}".format(str(round(cut_off, 4))))
+        logging.info(
+            "Determined --yfrac cutoff: {}".format(
+                str(round(cut_off, 4))
+            )
+        )
 
     genders[y_fractions > cut_off] = "M"
     genders[y_fractions < cut_off] = "F"
@@ -68,10 +105,9 @@ def train_gender_model(args, samples):
     return genders.tolist(), cut_off
 
 
-"""
-Finds mask (locations of bins without data) in the
-subset 'samples'.
-"""
+# ---------------------------------------------------------------------------
+# Masking
+# ---------------------------------------------------------------------------
 
 
 def get_mask(samples):
@@ -80,7 +116,9 @@ def get_mask(samples):
     sample_count = len(samples)
 
     for chr in range(1, 25):
-        max_len = max([sample[str(chr)].shape[0] for sample in samples])
+        max_len = max(
+            [sample[str(chr)].shape[0] for sample in samples]
+        )
         this_chr = np.zeros((max_len, sample_count), dtype=float)
         bins_per_chr.append(max_len)
         i = 0
@@ -94,17 +132,61 @@ def get_mask(samples):
     all_data = all_data / sum_per_sample
 
     sum_per_bin = np.sum(all_data, 1)
-    # Mask out bins with 0 reads OR reads less than 5% of the median coverage
-    # to reduce noise from small binsizes
     median_cov = np.median(sum_per_bin[sum_per_bin > 0])
     mask = sum_per_bin > (0.05 * median_cov)
 
     return mask, bins_per_chr
 
 
-"""
-Normalizes samples for read depth and applies mask.
-"""
+def apply_early_masking(masked_data, mask, samples, chrs):
+    """Pre-filter bins with near-zero mean or excessive variance.
+
+    Returns updated masked_data after modifying mask in-place.
+    """
+    mean_per_bin = np.mean(masked_data, axis=1)
+
+    # Bins with near-zero mean (relative threshold: < 1% of median)
+    # After depth normalization, absolute values are tiny fractions,
+    # so we use a relative threshold instead of absolute 1e-3.
+    median_mean = np.median(mean_per_bin[mean_per_bin > 0])
+    low_thresh = median_mean * 0.01
+    bad_low_mean = mean_per_bin < low_thresh
+    n_low = int(np.sum(bad_low_mean))
+
+    # Coefficient of variation filter
+    std_per_bin = np.std(masked_data, axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cv_per_bin = np.where(
+            mean_per_bin > 0,
+            std_per_bin / mean_per_bin,
+            np.inf,
+        )
+    finite_cv = cv_per_bin[np.isfinite(cv_per_bin)]
+    if len(finite_cv) > 0:
+        median_cv = np.median(finite_cv)
+        bad_high_cv = cv_per_bin > 3 * median_cv
+    else:
+        bad_high_cv = np.zeros(len(cv_per_bin), dtype=bool)
+    n_cv = int(np.sum(bad_high_cv & ~bad_low_mean))
+
+    bad_bins = bad_low_mean | bad_high_cv
+    n_total = int(np.sum(bad_bins))
+
+    if n_total > 0:
+        logging.info(
+            "Early masking: removing {} bins "
+            "({} low-mean, {} high-CV)".format(n_total, n_low, n_cv)
+        )
+        masked_indices = np.where(mask)[0]
+        mask[masked_indices[bad_bins]] = False
+        masked_data = normalize_and_mask(samples, chrs, mask)
+
+    return masked_data
+
+
+# ---------------------------------------------------------------------------
+# Normalization & PCA
+# ---------------------------------------------------------------------------
 
 
 def normalize_and_mask(samples, chrs, mask):
@@ -112,7 +194,9 @@ def normalize_and_mask(samples, chrs, mask):
     sample_count = len(samples)
 
     for chr in chrs:
-        max_len = max([sample[str(chr)].shape[0] for sample in samples])
+        max_len = max(
+            [sample[str(chr)].shape[0] for sample in samples]
+        )
         this_chr = np.zeros((max_len, sample_count), dtype=float)
         i = 0
         for sample in samples:
@@ -129,12 +213,6 @@ def normalize_and_mask(samples, chrs, mask):
     return masked_data
 
 
-"""
-Executes PCA. Rotations are saved which enable
-between sample normalization in the test phase.
-"""
-
-
 def train_pca(ref_data, pcacomp=5):
     t_data = ref_data.T
     pca = PCA(n_components=pcacomp)
@@ -147,132 +225,265 @@ def train_pca(ref_data, pcacomp=5):
     return corrected.T, pca
 
 
-"""
-Calculates within-sample reference.
-"""
+def reduce_dimensions(pca_corrected_data, n_components=30):
+    """PCA dimensionality reduction for KNN distance computation.
+
+    Reduces each bin's representation from n_samples to n_components
+    dimensions. Returns float32 array for ANN library compatibility.
+    """
+    n_bins, n_samples = pca_corrected_data.shape
+    actual = min(n_components, n_samples - 1, n_bins - 1)
+    if actual < n_components:
+        logging.info(
+            "Reducing n_components from {} to {} "
+            "(limited by data dimensions)".format(n_components, actual)
+        )
+    pca_reduce = PCA(n_components=actual)
+    reduced = pca_reduce.fit_transform(pca_corrected_data)
+    logging.info(
+        "Dimensionality reduction: {} -> {} components "
+        "(explained variance: {:.1f}%)".format(
+            n_samples,
+            actual,
+            100.0 * np.sum(pca_reduce.explained_variance_ratio_),
+        )
+    )
+    return reduced.astype(np.float32)
 
 
-def get_reference(
-    pca_corrected_data,
+# ---------------------------------------------------------------------------
+# KNN search backends
+# ---------------------------------------------------------------------------
+
+
+def _search_faiss(candidate_data, query_data, k):
+    """KNN search using faiss. Returns (distances, indices)."""
+    n_candidates, dim = candidate_data.shape
+    candidate_f32 = np.ascontiguousarray(
+        candidate_data, dtype=np.float32
+    )
+    query_f32 = np.ascontiguousarray(
+        query_data, dtype=np.float32
+    )
+
+    if n_candidates > 500_000:
+        nlist = int(np.sqrt(n_candidates))
+        quantizer = faiss.IndexFlatL2(dim)
+        index = faiss.IndexIVFFlat(quantizer, dim, nlist)
+        index.train(candidate_f32)
+        index.add(candidate_f32)
+        index.nprobe = min(50, max(1, nlist // 4))
+    else:
+        index = faiss.IndexFlatL2(dim)
+        index.add(candidate_f32)
+
+    distances, indices = index.search(query_f32, k)
+    return distances, indices.astype(np.int32)
+
+
+def _search_hnswlib(candidate_data, query_data, k):
+    """KNN search using hnswlib. Returns (distances, indices)."""
+    n_candidates, dim = candidate_data.shape
+    candidate_f32 = np.ascontiguousarray(
+        candidate_data, dtype=np.float32
+    )
+    query_f32 = np.ascontiguousarray(
+        query_data, dtype=np.float32
+    )
+
+    index = hnswlib.Index(space="l2", dim=dim)
+    index.init_index(
+        max_elements=n_candidates, ef_construction=200, M=32
+    )
+    index.add_items(candidate_f32)
+    index.set_ef(max(k * 2, 100))
+
+    indices, distances = index.knn_query(query_f32, k=k)
+    return distances.astype(np.float64), indices.astype(np.int32)
+
+
+def _search_sklearn(candidate_data, query_data, k):
+    """KNN search using sklearn. Returns (sq distances, indices)."""
+    from sklearn.neighbors import NearestNeighbors
+
+    nn = NearestNeighbors(
+        n_neighbors=k, algorithm="auto", metric="euclidean"
+    )
+    nn.fit(candidate_data)
+    distances, indices = nn.kneighbors(query_data)
+    # Square distances for consistency with faiss/hnswlib (L2 squared)
+    return (distances ** 2).astype(np.float64), indices.astype(
+        np.int32
+    )
+
+
+def build_and_search_knn(candidate_data, query_data, k):
+    """Dispatch KNN search to best available backend.
+
+    Returns (distances, indices) where distances are squared L2.
+    """
+    if _KNN_BACKEND == "faiss":
+        return _search_faiss(candidate_data, query_data, k)
+    elif _KNN_BACKEND == "hnswlib":
+        return _search_hnswlib(candidate_data, query_data, k)
+    else:
+        return _search_sklearn(candidate_data, query_data, k)
+
+
+# ---------------------------------------------------------------------------
+# Chromosome-level KNN orchestration
+# ---------------------------------------------------------------------------
+
+
+def knn_search_all_chromosomes(
+    pca_reduced_data,
     masked_bins_per_chr,
     masked_bins_per_chr_cum,
     ref_size,
-    part,
-    split_parts,
+    chunk_size=50000,
 ):
-    big_indexes = []
-    big_distances = []
+    """Find KNN references for all bins, chromosome by chromosome.
 
-    bincount = masked_bins_per_chr_cum[-1]
+    For each chromosome, candidate bins are all bins NOT on that
+    chromosome (same logic as the original get_reference).
 
-    start_num, end_num = _get_part(part - 1, split_parts, bincount)
-    logging.info(
-        "Working on thread {} of {}, meaning bins {} up to {}".format(
-            part, split_parts, start_num, end_num
-        )
+    Returns (indexes, distances) with identical semantics to the
+    original code: indexes are into chr_data (the all-but-this-chr
+    concatenation).
+    """
+    _log_knn_backend()
+
+    total_bins = int(masked_bins_per_chr_cum[-1])
+    all_indexes = np.zeros(
+        (total_bins, ref_size), dtype=np.int32
     )
-    regions = _split_by_chr(start_num, end_num, masked_bins_per_chr_cum)
+    all_distances = np.ones(
+        (total_bins, ref_size), dtype=np.float64
+    )
 
-    for region in regions:
-        chr = region[0]
-        start = region[1]
-        end = region[2]
+    n_chrs = len(masked_bins_per_chr)
+    is_gonosomal = n_chrs > 22
 
-        if start_num > start:
-            start = start_num
-        if end_num < end:
-            end = end_num
+    for chr_idx in range(n_chrs):
+        chr_start = int(
+            masked_bins_per_chr_cum[chr_idx]
+            - masked_bins_per_chr[chr_idx]
+        )
+        chr_end = int(masked_bins_per_chr_cum[chr_idx])
+        n_chr_bins = chr_end - chr_start
 
-        if len(masked_bins_per_chr_cum) > 22 and chr != 22 and chr != 23:
-            part_indexes = np.zeros((end - start, ref_size), dtype=np.int32)
-            part_distances = np.ones((end - start, ref_size))
-            big_indexes.extend(part_indexes)
-            big_distances.extend(part_distances)
+        if n_chr_bins == 0:
             continue
-        chr_data = np.concatenate(
+
+        # For gonosomal references, skip non-gonosomal chromosomes
+        if is_gonosomal and chr_idx != 22 and chr_idx != 23:
+            continue
+
+        # Build candidate data: all bins NOT on this chromosome
+        # Same concatenation as original code
+        candidate_data = np.concatenate(
             (
-                pca_corrected_data[
-                    : masked_bins_per_chr_cum[chr] - masked_bins_per_chr[chr], :
-                ],
-                pca_corrected_data[masked_bins_per_chr_cum[chr] :, :],
+                pca_reduced_data[:chr_start],
+                pca_reduced_data[chr_end:],
             )
         )
 
-        part_indexes, part_distances = get_ref_for_bins(
-            ref_size, start, end, pca_corrected_data, chr_data
+        query_data = pca_reduced_data[chr_start:chr_end]
+
+        # Process in chunks for memory efficiency
+        for chunk_start in range(0, n_chr_bins, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_chr_bins)
+            chunk_query = query_data[chunk_start:chunk_end]
+
+            actual_k = min(ref_size, len(candidate_data))
+            distances, indices = build_and_search_knn(
+                candidate_data, chunk_query, actual_k
+            )
+
+            global_start = chr_start + chunk_start
+            global_end = chr_start + chunk_end
+
+            if actual_k < ref_size:
+                all_indexes[global_start:global_end, :actual_k] = (
+                    indices
+                )
+                all_distances[global_start:global_end, :actual_k] = (
+                    distances
+                )
+            else:
+                all_indexes[global_start:global_end] = indices
+                all_distances[global_start:global_end] = distances
+
+        logging.info(
+            "KNN complete for chr {} ({} bins)".format(
+                chr_idx + 1, n_chr_bins
+            )
         )
 
-        big_indexes.extend(part_indexes)
-        big_distances.extend(part_distances)
+    return all_indexes, all_distances
 
-    index_array = np.array(big_indexes)
-    distance_array = np.array(big_distances)
-    null_ratio_array = np.zeros(
-        (len(distance_array), min(len(pca_corrected_data[0]), 100))
+
+# ---------------------------------------------------------------------------
+# Null ratio computation (vectorized)
+# ---------------------------------------------------------------------------
+
+
+def compute_null_ratios_chunk(
+    pca_corrected_data, indexes, start, end
+):
+    """Compute null ratios for bins [start, end). Vectorized."""
+    n_samples = pca_corrected_data.shape[1]
+    n_null = min(n_samples, 100)
+    chunk_indexes = indexes[start:end]
+    null_ratios = np.zeros((end - start, n_null))
+
+    samples_t = pca_corrected_data.T  # (n_samples, n_bins)
+    sample_indices = random.sample(range(n_samples), n_null)
+
+    for null_i, case_i in enumerate(sample_indices):
+        sample = samples_t[case_i]
+        bin_values = sample[start:end]
+        ref_values = sample[chunk_indexes]
+        medians = np.median(ref_values, axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            null_ratios[:, null_i] = np.log2(
+                bin_values / medians
+            )
+
+    return null_ratios
+
+
+def compute_null_ratios_parallel(
+    pca_corrected_data, indexes, cpus=1, chunk_size=50000
+):
+    """Compute null ratios in parallel chunks using joblib."""
+    from joblib import Parallel, delayed
+
+    total_bins = len(indexes)
+    chunks = []
+    for start in range(0, total_bins, chunk_size):
+        end = min(start + chunk_size, total_bins)
+        chunks.append((start, end))
+
+    logging.info(
+        "Computing null ratios: {} chunks, {} cpus".format(
+            len(chunks), cpus
+        )
     )
-    samples = np.transpose(pca_corrected_data)
-    for null_i, case_i in enumerate(
-        random.sample(
-            range(len(pca_corrected_data[0])), min(len(pca_corrected_data[0]), 100)
+
+    if cpus == 1:
+        results = [
+            compute_null_ratios_chunk(
+                pca_corrected_data, indexes, start, end
+            )
+            for start, end in chunks
+        ]
+    else:
+        results = Parallel(n_jobs=cpus)(
+            delayed(compute_null_ratios_chunk)(
+                pca_corrected_data, indexes, start, end
+            )
+            for start, end in chunks
         )
-    ):
-        sample = samples[case_i]
-        for bin_i in list(range(len(sample)))[start_num:end_num]:
-            ref = sample[index_array[bin_i - start_num]]
-            r = np.log2(sample[bin_i] / np.median(ref))
-            null_ratio_array[bin_i - start_num][null_i] = r
-    return index_array, distance_array, null_ratio_array
 
-
-def _split_by_chr(start, end, chr_bin_sums):
-    areas = []
-    tmp = [0, start, 0]
-    for i, val in enumerate(chr_bin_sums):
-        tmp[0] = i
-        if val >= end:
-            break
-        if start < val < end:
-            tmp[2] = val
-            areas.append(tmp)
-            tmp = [i, val, 0]
-        tmp[1] = val
-    tmp[2] = end
-    areas.append(tmp)
-    return areas
-
-
-def _get_part(partnum, outof, bincount):
-    start_bin = int(bincount / float(outof) * partnum)
-    end_bin = int(bincount / float(outof) * (partnum + 1))
-    return start_bin, end_bin
-
-
-"""
-Calculates within-sample reference for a particular chromosome.
-"""
-
-
-def get_ref_for_bins(ref_size, start, end, pca_corrected_data, chr_data):
-    find_pos = bisect.bisect
-    ref_indexes = np.zeros((end - start, ref_size), dtype=np.int32)
-    ref_distances = np.ones((end - start, ref_size))
-    for this_bin in range(start, end):
-        this_mask = np.sum(np.power(chr_data - pca_corrected_data[this_bin, :], 2), 1)
-        this_indexes = [-1 for i in range(ref_size)]
-        this_distances = [1e10 for i in range(ref_size)]
-        remove_index = this_indexes.pop
-        remove_dist = this_distances.pop
-        insert_index = this_indexes.insert
-        insert_dist = this_distances.insert
-        cur_max = 1e10
-        for i, binVal in enumerate(this_mask):
-            if binVal < cur_max:
-                pos = find_pos(this_distances, binVal)
-                remove_index(-1)
-                remove_dist(-1)
-                insert_index(pos, i)
-                insert_dist(pos, binVal)
-                cur_max = this_distances[-1]
-        ref_indexes[this_bin - start, :] = this_indexes
-        ref_distances[this_bin - start, :] = this_distances
-    return ref_indexes, ref_distances
+    return np.concatenate(results, axis=0)
